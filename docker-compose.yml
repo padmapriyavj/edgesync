@@ -18,6 +18,19 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+  origin:
+    build: ./services/origin
+    container_name: edgesync-origin
+    environment:
+      PORT: 4000
+      DATABASE_URL: postgresql://edgesync_user:edgesync_pass@postgres:5432/edgesync
+      NODE_ENV: production
+    ports:
+      - "4000:4000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   postgres_data:
