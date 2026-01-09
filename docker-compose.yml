@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   postgres:
     image: postgres:15-alpine
@@ -31,6 +29,50 @@ services:
       postgres:
         condition: service_healthy
     restart: unless-stopped
-
+  redis-us-east:
+    image: redis:7-alpine
+    container_name: edgesync-redis-us-east
+    command: redis-server /usr/local/etc/redis/redis.conf
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_us_data:/data
+      - ./infrastructure/redis/redis.conf:/usr/local/etc/redis/redis.conf
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  redis-eu-west:
+    image: redis:7-alpine
+    container_name: edgesync-redis-eu-west
+    command: redis-server /usr/local/etc/redis/redis.conf
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_eu_data:/data
+      - ./infrastructure/redis/redis.conf:/usr/local/etc/redis/redis.conf
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  redis-ap-south:
+    image: redis:7-alpine
+    container_name: edgesync-redis-ap-south
+    command: redis-server /usr/local/etc/redis/redis.conf
+    ports:
+      - "6381:6379"
+    volumes:
+      - redis_ap_data:/data
+      - ./infrastructure/redis/redis.conf:/usr/local/etc/redis/redis.conf
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 volumes:
   postgres_data:
+  redis_us_data:
+  redis_eu_data:
+  redis_ap_data:
