@@ -22,11 +22,14 @@ services:
     environment:
       PORT: 4000
       DATABASE_URL: postgresql://edgesync_user:edgesync_pass@postgres:5432/edgesync
+      KAFKA_BROKERS: kafka:29092
       NODE_ENV: production
     ports:
       - "4000:4000"
     depends_on:
       postgres:
+        condition: service_healthy
+      kafka:
         condition: service_healthy
     restart: unless-stopped
   redis-us-east:
@@ -71,8 +74,65 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: edgesync-kafka
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      CLUSTER_ID: edgesync-kafka-cluster
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    command: >
+      bash -c "
+      echo 'Generating cluster ID...' &&
+      CLUSTER_ID=$$(kafka-storage random-uuid) &&
+      echo 'Formatting storage...' &&
+      kafka-storage format -t $$CLUSTER_ID -c /etc/kafka/kraft/server.properties &&
+      echo 'Starting Kafka...' &&
+      /etc/confluent/docker/run
+      "
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "kafka-broker-api-versions",
+          "--bootstrap-server",
+          "localhost:9092",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  # Kafka UI (for monitoring)
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: edgesync-kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: edgesync
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      DYNAMIC_CONFIG_ENABLED: "true"
 volumes:
   postgres_data:
   redis_us_data:
   redis_eu_data:
   redis_ap_data:
+  kafka_data:

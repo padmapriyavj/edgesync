@@ -1,61 +1,69 @@
-import express, { Request, Response } from "express";
-import dotenv from "dotenv";
-import { Pool } from "pg";
-import cors from "cors";
-import helmet from "helmet";
-import morgan from "morgan";
-import { ContentService } from "./services/content.service";
-import { createContentRouter } from "./routes/content.routes";
+import express, { Request, Response } from 'express';
+import { Pool } from 'pg';
+import dotenv from 'dotenv';
+import cors from 'cors';
+import helmet from 'helmet';
+import morgan from 'morgan';
+import { ContentService } from './services/content.service';
+import { createContentRouter } from './routes/content.routes';
+import { InvalidationProducer } from './messaging/kafka.producer';
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 4000;
 
-//Database connection
+// Database connection
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
 });
 
-//Services
+// Kafka producer
+const kafkaBrokers = (process.env.KAFKA_BROKERS || 'localhost:9092').split(',');
+const invalidationProducer = new InvalidationProducer(kafkaBrokers);
+
+// Services
 const contentService = new ContentService(pool);
 
-//Middleware
+// Middleware
 app.use(helmet());
 app.use(cors());
-app.use(morgan("dev"));
+app.use(morgan('dev'));
 app.use(express.json());
 
-//Routes
-app.use("/api/content", createContentRouter(contentService));
+// Routes - pass producer to routes
+app.use('/api/content', createContentRouter(contentService, invalidationProducer));
 
-//health check route
-app.get("/health", async (req: Request, res: Response) => {
+// Health check
+app.get('/health', async (req: Request, res: Response) => {
   try {
-    await pool.query("SELECT 1");
-    res.json({
-      status: "ok",
-      service: "origin",
-      database: "connected",
-    });
+    await pool.query('SELECT 1');
+    res.json({ status: 'ok', service: 'origin', database: 'connected' });
   } catch (error) {
-    res.status(500).json({
-      status: "error",
-      service: "origin",
-      database: "disconnected",
-    });
+    res.status(500).json({ status: 'error', service: 'origin', database: 'disconnected' });
   }
 });
 
-app.get("/api/test", async (req: Request, res: Response) => {
+// Start server
+async function start() {
   try {
-    const result = await pool.query("SELECT * FROM content LIMIT 3");
-    res.json({ success: true, data: result.rows });
+    // Connect to Kafka
+    await invalidationProducer.connect();
+    
+    app.listen(PORT, () => {
+      console.log(` Origin server running on port ${PORT}`);
+    });
   } catch (error) {
-    res.status(500).json({ success: false, error: (error as Error).message });
+    console.error('Failed to start origin server:', error);
+    process.exit(1);
   }
+}
+
+process.on('SIGINT', async () => {
+  console.log('\n Shutting down gracefully...');
+  await invalidationProducer.disconnect();
+  await pool.end();
+  process.exit(0);
 });
 
-app.listen(PORT, () => {
-  console.log(`Origin server running on port ${PORT}`);
-});
+start();
