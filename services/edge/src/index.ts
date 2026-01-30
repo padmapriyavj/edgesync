@@ -5,6 +5,10 @@ import helmet from "helmet";
 import morgan from "morgan";
 import { CacheClient } from "./cache/redis.client";
 import { OriginClient } from "./clients/origin.client";
+import {
+  InvalidationConsumer,
+  InvalidationEvent,
+} from "../src/messaging/kafka.consumer";
 
 dotenv.config();
 
@@ -14,10 +18,116 @@ const REGION_NAME = process.env.REGION_NAME || "us-east";
 const REDIS_URL = process.env.REDIS_URL || "redis://localhost:6379";
 const ORIGIN_URL = process.env.ORIGIN_URL || "http://localhost:4000";
 const CACHE_TTL = parseInt(process.env.CACHE_TTL || "3600");
+const KAFKA_BROKERS = (process.env.KAFKA_BROKERS || "localhost:9092").split(
+  ","
+);
+const INVALIDATION_STRATEGY = process.env.INVALIDATION_STRATEGY || "eager";
+const PROPAGATION_DELAY = parseInt(process.env.PROPAGATION_DELAY || "0");
 
 // Initialize clients
 const cache = new CacheClient(REDIS_URL);
 const originClient = new OriginClient(ORIGIN_URL, REGION_NAME);
+const invalidationConsumer = new InvalidationConsumer(
+  KAFKA_BROKERS,
+  REGION_NAME
+);
+
+// Sleep utility for simulating geographic delay
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+// Geographic delay configuration
+const getRegionDelay = (region: string): number => {
+  const delays: Record<string, number> = {
+    "us-east": 100,
+    "eu-west": 300,
+    "ap-south": 600,
+  };
+  return delays[region] || 0;
+};
+
+// Invalidation handler with geographic delay
+async function handleInvalidation(event: InvalidationEvent): Promise<void> {
+  const eventReceivedAt = Date.now();
+  const delay = PROPAGATION_DELAY || getRegionDelay(REGION_NAME);
+
+  console.log(
+    `[${REGION_NAME}] Received invalidation event: ${event.type} - ${event.target}`
+  );
+  console.log(
+    `[${REGION_NAME}] Simulating ${delay}ms geographic propagation delay...`
+  );
+
+  // Simulate geographic propagation delay
+  await sleep(delay);
+
+  const processingStartedAt = Date.now();
+  const actualDelay = processingStartedAt - eventReceivedAt;
+
+  console.log(
+    `[${REGION_NAME}] Processing invalidation after ${actualDelay}ms: ${event.type} - ${event.target}`
+  );
+
+  try {
+    if (INVALIDATION_STRATEGY === "eager") {
+      await eagerInvalidate(event);
+    } else if (INVALIDATION_STRATEGY === "lazy") {
+      await lazyInvalidate(event);
+    }
+  } catch (error) {
+    console.error(`[${REGION_NAME}] Invalidation error:`, error);
+  }
+}
+
+// Eager invalidation: Delete immediately
+async function eagerInvalidate(event: InvalidationEvent): Promise<void> {
+  if (event.type === "key") {
+    await cache.del(event.target);
+    console.log(`[${REGION_NAME}] EAGER: Deleted ${event.target}`);
+  }
+}
+
+// Lazy invalidation: Mark as stale
+async function lazyInvalidate(event: InvalidationEvent): Promise<void> {
+  if (event.type === "key") {
+    await cache.markStale(event.target);
+    console.log(`[${REGION_NAME}] LAZY: Marked ${event.target} as stale`);
+  }
+}
+
+// Background revalidation for lazy invalidation
+async function backgroundRevalidate(
+  cacheKey: string,
+  id: string
+): Promise<void> {
+  try {
+    console.log(`[${REGION_NAME}] Background revalidation: ${cacheKey}`);
+
+    const content = await originClient.getContent(id);
+
+    await cache.setWithMetadata(
+      cacheKey,
+      {
+        value: content,
+        metadata: {
+          version: content.version,
+          cachedAt: Date.now(),
+          expiresAt: Date.now() + CACHE_TTL * 1000,
+          stale: false,
+        },
+      },
+      CACHE_TTL
+    );
+
+    await cache.clearStale(cacheKey);
+
+    console.log(
+      `[${REGION_NAME}] Background revalidation complete: ${cacheKey}`
+    );
+  } catch (error) {
+    console.error(`[${REGION_NAME}] Background revalidation failed:`, error);
+  }
+}
 
 // Middleware
 app.use(helmet());
@@ -35,34 +145,69 @@ app.get("/health", async (req: Request, res: Response) => {
     region: REGION_NAME,
     cache: cache.isConnected() ? "connected" : "disconnected",
     origin: originHealthy ? "connected" : "disconnected",
+    strategy: INVALIDATION_STRATEGY,
   });
 });
 
-// Content endpoint with caching
+// Content endpoint with caching and stale-while-revalidate support
 app.get("/api/content/:id", async (req: Request, res: Response) => {
   const { id } = req.params;
   const cacheKey = `content:${id}`;
+  const startTime = Date.now();
 
   try {
     // 1. Check cache first
     const cached = await cache.getWithMetaData(cacheKey);
+    const isStale = await cache.isStale(cacheKey);
 
-    if (cached && !cached.metadata.stale) {
-      console.log(`[${REGION_NAME}] Cache HIT: ${cacheKey}`);
+    // 2. Fresh cache hit
+    if (cached && !isStale) {
+      const latency = Date.now() - startTime;
+      console.log(
+        `[${REGION_NAME}] Cache HIT (fresh): ${cacheKey} - ${latency}ms`
+      );
       return res.json({
         success: true,
         data: cached.value,
         source: "cache",
+        status: "fresh",
         region: REGION_NAME,
+        latency_ms: latency,
         cached_at: new Date(cached.metadata.cachedAt).toISOString(),
       });
     }
 
-    // 2. Cache miss - fetch from origin
+    // 3. Stale cache hit (lazy invalidation)
+    if (cached && isStale) {
+      const latency = Date.now() - startTime;
+      console.log(
+        `[${REGION_NAME}] Cache HIT (stale): ${cacheKey} - ${latency}ms`
+      );
+
+      // Serve stale data immediately
+      res.json({
+        success: true,
+        data: cached.value,
+        source: "cache",
+        status: "stale",
+        region: REGION_NAME,
+        latency_ms: latency,
+        cached_at: new Date(cached.metadata.cachedAt).toISOString(),
+      });
+
+      // Background revalidation (don't await)
+      backgroundRevalidate(cacheKey, id).catch((err) =>
+        console.error(`Background revalidation failed for ${cacheKey}:`, err)
+      );
+
+      return;
+    }
+
+    // 4. Cache miss - fetch from origin
     console.log(`[${REGION_NAME}] Cache MISS: ${cacheKey}`);
     const content = await originClient.getContent(id);
 
-    // 3. Store in cache with metadata
+    // 5. Store in cache with metadata
     await cache.setWithMetadata(
       cacheKey,
       {
@@ -77,14 +222,17 @@ app.get("/api/content/:id", async (req: Request, res: Response) => {
       CACHE_TTL
     );
 
-    console.log(`[${REGION_NAME}] Cached: ${cacheKey}`);
+    const latency = Date.now() - startTime;
+    console.log(`[${REGION_NAME}] Cached: ${cacheKey} - ${latency}ms`);
 
-    // 4. Return data
+    // 6. Return data
     res.json({
       success: true,
       data: content,
       source: "origin",
+      status: "fresh",
       region: REGION_NAME,
+      latency_ms: latency,
     });
   } catch (error) {
     console.error(`[${REGION_NAME}] Error:`, error);
@@ -145,20 +293,29 @@ async function start() {
     // Connect to Redis
     await cache.connect();
 
+    // Connect to Kafka and subscribe
+    await invalidationConsumer.connect();
+    await invalidationConsumer.subscribe(handleInvalidation);
+
     // Check origin health
     const originHealthy = await originClient.healthCheck();
     if (!originHealthy) {
       console.warn("⚠️  Warning: Origin server not responding");
     } else {
-      console.log("Origin server connected");
+      console.log("✅ Origin server connected");
     }
 
     // Start Express server
     app.listen(PORT, () => {
       console.log(`Edge service [${REGION_NAME}] running on port ${PORT}`);
+      console.log(`Strategy: ${INVALIDATION_STRATEGY.toUpperCase()}`);
+      console.log(
+        `Propagation delay: ${
+          PROPAGATION_DELAY || getRegionDelay(REGION_NAME)
+        }ms`
+      );
       console.log(`Health: http://localhost:${PORT}/health`);
       console.log(`Content: http://localhost:${PORT}/api/content/:id`);
-      console.log(`List: http://localhost:${PORT}/api/content`);
     });
   } catch (error) {
     console.error("Failed to start edge service:", error);
@@ -169,6 +326,7 @@ async function start() {
 // Graceful shutdown
 process.on("SIGINT", async () => {
   console.log("\n Shutting down gracefully...");
+  await invalidationConsumer.disconnect();
   await cache.disconnect();
   process.exit(0);
 });
