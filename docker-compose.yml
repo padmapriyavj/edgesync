@@ -9,13 +9,14 @@ services:
     ports:
       - "5433:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/postgres_data
+      - postgres_data:/var/lib/postgresql/data
       - ./infrastructure/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U edgesync_user -d edgesync"]
       interval: 10s
       timeout: 5s
       retries: 5
+
   origin:
     build: ./services/origin
     container_name: edgesync-origin
@@ -32,48 +33,8 @@ services:
       kafka:
         condition: service_healthy
     restart: unless-stopped
-  redis-us-east:
-    image: redis:7-alpine
-    container_name: edgesync-redis-us-east
-    command: redis-server /usr/local/etc/redis/redis.conf
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_us_data:/data
-      - ./infrastructure/redis/redis.conf:/usr/local/etc/redis/redis.conf
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-  redis-eu-west:
-    image: redis:7-alpine
-    container_name: edgesync-redis-eu-west
-    command: redis-server /usr/local/etc/redis/redis.conf
-    ports:
-      - "6380:6379"
-    volumes:
-      - redis_eu_data:/data
-      - ./infrastructure/redis/redis.conf:/usr/local/etc/redis/redis.conf
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-  redis-ap-south:
-    image: redis:7-alpine
-    container_name: edgesync-redis-ap-south
-    command: redis-server /usr/local/etc/redis/redis.conf
-    ports:
-      - "6381:6379"
-    volumes:
-      - redis_ap_data:/data
-      - ./infrastructure/redis/redis.conf:/usr/local/etc/redis/redis.conf
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+
+  # Kafka with KRaft (no Zookeeper)
   kafka:
     image: confluentinc/cp-kafka:7.5.0
     container_name: edgesync-kafka
@@ -106,18 +67,12 @@ services:
       /etc/confluent/docker/run
       "
     healthcheck:
-      test:
-        [
-          "CMD",
-          "kafka-broker-api-versions",
-          "--bootstrap-server",
-          "localhost:9092",
-        ]
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
       interval: 10s
       timeout: 10s
       retries: 5
 
-  # Kafka UI (for monitoring)
+  # Kafka UI
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     container_name: edgesync-kafka-ui
@@ -130,6 +85,100 @@ services:
       KAFKA_CLUSTERS_0_NAME: edgesync
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
       DYNAMIC_CONFIG_ENABLED: "true"
+
+  # Redis for US East
+  redis-us-east:
+    image: redis:7-alpine
+    container_name: edgesync-redis-us-east
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_us_data:/data
+
+  # Redis for EU West
+  redis-eu-west:
+    image: redis:7-alpine
+    container_name: edgesync-redis-eu-west
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_eu_data:/data
+
+  # Redis for AP South
+  redis-ap-south:
+    image: redis:7-alpine
+    container_name: edgesync-redis-ap-south
+    ports:
+      - "6381:6379"
+    volumes:
+      - redis_ap_data:/data
+
+  # Edge Region: US East (100ms delay, EAGER strategy)
+  edge-us-east:
+    build: ./services/edge
+    container_name: edgesync-edge-us-east
+    environment:
+      REGION_NAME: us-east
+      EDGE_PORT: 5001
+      PROPAGATION_DELAY: 100
+      INVALIDATION_STRATEGY: eager
+      REDIS_URL: redis://redis-us-east:6379
+      ORIGIN_URL: http://origin:4000
+      CACHE_TTL: 3600
+      KAFKA_BROKERS: kafka:29092
+      NODE_ENV: production
+    ports:
+      - "5001:5001"
+    depends_on:
+      - redis-us-east
+      - kafka
+      - origin
+    restart: unless-stopped
+
+  # Edge Region: EU West (300ms delay, LAZY strategy)
+  edge-eu-west:
+    build: ./services/edge
+    container_name: edgesync-edge-eu-west
+    environment:
+      REGION_NAME: eu-west
+      EDGE_PORT: 5002
+      PROPAGATION_DELAY: 300
+      INVALIDATION_STRATEGY: lazy
+      REDIS_URL: redis://redis-eu-west:6379
+      ORIGIN_URL: http://origin:4000
+      CACHE_TTL: 3600
+      KAFKA_BROKERS: kafka:29092
+      NODE_ENV: production
+    ports:
+      - "5002:5002"
+    depends_on:
+      - redis-eu-west
+      - kafka
+      - origin
+    restart: unless-stopped
+
+  # Edge Region: AP South (600ms delay, LAZY strategy)
+  edge-ap-south:
+    build: ./services/edge
+    container_name: edgesync-edge-ap-south
+    environment:
+      REGION_NAME: ap-south
+      EDGE_PORT: 5003
+      PROPAGATION_DELAY: 600
+      INVALIDATION_STRATEGY: lazy
+      REDIS_URL: redis://redis-ap-south:6379
+      ORIGIN_URL: http://origin:4000
+      CACHE_TTL: 3600
+      KAFKA_BROKERS: kafka:29092
+      NODE_ENV: production
+    ports:
+      - "5003:5003"
+    depends_on:
+      - redis-ap-south
+      - kafka
+      - origin
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   redis_us_data:

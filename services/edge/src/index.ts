@@ -8,7 +8,7 @@ import { OriginClient } from "./clients/origin.client";
 import {
   InvalidationConsumer,
   InvalidationEvent,
-} from "../src/messaging/kafka.consumer";
+} from "./messaging/kafka.consumer";
 
 dotenv.config();
 
