@@ -9,6 +9,7 @@ import {
   InvalidationConsumer,
   InvalidationEvent,
 } from "./messaging/kafka.consumer";
+import { MetricsTracker } from "./metrics/metrics.tracker";
 
 dotenv.config();
 
@@ -31,6 +32,7 @@ const invalidationConsumer = new InvalidationConsumer(
   KAFKA_BROKERS,
   REGION_NAME
 );
+const metrics = new MetricsTracker();
 
 // Sleep utility for simulating geographic delay
 const sleep = (ms: number): Promise<void> =>
@@ -52,30 +54,31 @@ async function handleInvalidation(event: InvalidationEvent): Promise<void> {
   const delay = PROPAGATION_DELAY || getRegionDelay(REGION_NAME);
 
   console.log(
-    `[${REGION_NAME}] Received invalidation event: ${event.type} - ${event.target}`
+    ` [${REGION_NAME}] Received invalidation event: ${event.type} - ${event.target}`
   );
   console.log(
-    `[${REGION_NAME}] Simulating ${delay}ms geographic propagation delay...`
+    ` [${REGION_NAME}] Simulating ${delay}ms geographic propagation delay...`
   );
 
-  // Simulate geographic propagation delay
   await sleep(delay);
 
   const processingStartedAt = Date.now();
   const actualDelay = processingStartedAt - eventReceivedAt;
 
   console.log(
-    `[${REGION_NAME}] Processing invalidation after ${actualDelay}ms: ${event.type} - ${event.target}`
+    ` [${REGION_NAME}] Processing invalidation after ${actualDelay}ms: ${event.type} - ${event.target}`
   );
 
   try {
     if (INVALIDATION_STRATEGY === "eager") {
       await eagerInvalidate(event);
+      metrics.recordInvalidation("eager");
     } else if (INVALIDATION_STRATEGY === "lazy") {
       await lazyInvalidate(event);
+      metrics.recordInvalidation("lazy");
     }
   } catch (error) {
-    console.error(`[${REGION_NAME}] Invalidation error:`, error);
+    console.error(` [${REGION_NAME}] Invalidation error:`, error);
   }
 }
 
@@ -83,7 +86,7 @@ async function handleInvalidation(event: InvalidationEvent): Promise<void> {
 async function eagerInvalidate(event: InvalidationEvent): Promise<void> {
   if (event.type === "key") {
     await cache.del(event.target);
-    console.log(`[${REGION_NAME}] EAGER: Deleted ${event.target}`);
+    console.log(` [${REGION_NAME}] EAGER: Deleted ${event.target}`);
   }
 }
 
@@ -91,7 +94,7 @@ async function eagerInvalidate(event: InvalidationEvent): Promise<void> {
 async function lazyInvalidate(event: InvalidationEvent): Promise<void> {
   if (event.type === "key") {
     await cache.markStale(event.target);
-    console.log(`[${REGION_NAME}] LAZY: Marked ${event.target} as stale`);
+    console.log(` [${REGION_NAME}] LAZY: Marked ${event.target} as stale`);
   }
 }
 
@@ -101,7 +104,7 @@ async function backgroundRevalidate(
   id: string
 ): Promise<void> {
   try {
-    console.log(`[${REGION_NAME}] Background revalidation: ${cacheKey}`);
+    console.log(`🔄 [${REGION_NAME}] Background revalidation: ${cacheKey}`);
 
     const content = await originClient.getContent(id);
 
@@ -122,10 +125,10 @@ async function backgroundRevalidate(
     await cache.clearStale(cacheKey);
 
     console.log(
-      `[${REGION_NAME}] Background revalidation complete: ${cacheKey}`
+      ` [${REGION_NAME}] Background revalidation complete: ${cacheKey}`
     );
   } catch (error) {
-    console.error(`[${REGION_NAME}] Background revalidation failed:`, error);
+    console.error(` [${REGION_NAME}] Background revalidation failed:`, error);
   }
 }
 
@@ -149,22 +152,33 @@ app.get("/health", async (req: Request, res: Response) => {
   });
 });
 
-// Content endpoint with caching and stale-while-revalidate support
+// Metrics endpoint
+app.get("/metrics", (req: Request, res: Response) => {
+  const snapshot = metrics.getSnapshot();
+  res.json({
+    success: true,
+    region: REGION_NAME,
+    strategy: INVALIDATION_STRATEGY,
+    metrics: snapshot,
+  });
+});
+
+// Content endpoint with caching and metrics
 app.get("/api/content/:id", async (req: Request, res: Response) => {
   const { id } = req.params;
   const cacheKey = `content:${id}`;
   const startTime = Date.now();
 
   try {
-    // 1. Check cache first
     const cached = await cache.getWithMetaData(cacheKey);
     const isStale = await cache.isStale(cacheKey);
 
-    // 2. Fresh cache hit
+    // Fresh cache hit
     if (cached && !isStale) {
       const latency = Date.now() - startTime;
+      metrics.recordCacheHit(latency, false);
       console.log(
-        `[${REGION_NAME}] Cache HIT (fresh): ${cacheKey} - ${latency}ms`
+        ` [${REGION_NAME}] Cache HIT (fresh): ${cacheKey} - ${latency}ms`
       );
       return res.json({
         success: true,
@@ -177,14 +191,14 @@ app.get("/api/content/:id", async (req: Request, res: Response) => {
       });
     }
 
-    // 3. Stale cache hit (lazy invalidation)
+    // Stale cache hit (lazy invalidation)
     if (cached && isStale) {
       const latency = Date.now() - startTime;
+      metrics.recordCacheHit(latency, true);
       console.log(
-        `[${REGION_NAME}] Cache HIT (stale): ${cacheKey} - ${latency}ms`
+        ` [${REGION_NAME}] Cache HIT (stale): ${cacheKey} - ${latency}ms`
       );
 
-      // Serve stale data immediately
       res.json({
         success: true,
         data: cached.value,
@@ -195,7 +209,6 @@ app.get("/api/content/:id", async (req: Request, res: Response) => {
         cached_at: new Date(cached.metadata.cachedAt).toISOString(),
       });
 
-      // Background revalidation (don't await)
       backgroundRevalidate(cacheKey, id).catch((err) =>
         console.error(`Background revalidation failed for ${cacheKey}:`, err)
       );
@@ -203,11 +216,10 @@ app.get("/api/content/:id", async (req: Request, res: Response) => {
       return;
     }
 
-    // 4. Cache miss - fetch from origin
-    console.log(`[${REGION_NAME}] Cache MISS: ${cacheKey}`);
+    // Cache miss
+    console.log(` [${REGION_NAME}] Cache MISS: ${cacheKey}`);
     const content = await originClient.getContent(id);
 
-    // 5. Store in cache with metadata
     await cache.setWithMetadata(
       cacheKey,
       {
@@ -223,9 +235,9 @@ app.get("/api/content/:id", async (req: Request, res: Response) => {
     );
 
     const latency = Date.now() - startTime;
-    console.log(`[${REGION_NAME}] Cached: ${cacheKey} - ${latency}ms`);
+    metrics.recordCacheMiss(latency);
+    console.log(` [${REGION_NAME}] Cached: ${cacheKey} - ${latency}ms`);
 
-    // 6. Return data
     res.json({
       success: true,
       data: content,
@@ -235,7 +247,7 @@ app.get("/api/content/:id", async (req: Request, res: Response) => {
       latency_ms: latency,
     });
   } catch (error) {
-    console.error(`[${REGION_NAME}] Error:`, error);
+    console.error(` [${REGION_NAME}] Error:`, error);
 
     if ((error as Error).message.includes("not found")) {
       return res.status(404).json({
@@ -268,55 +280,37 @@ app.get("/api/content", async (req: Request, res: Response) => {
   }
 });
 
-// Test cache endpoint (for debugging)
-app.get("/test-cache", async (req: Request, res: Response) => {
-  try {
-    await cache.set("test-key", { message: "Hello from cache!" }, 60);
-    const value = await cache.get("test-key");
-
-    res.json({
-      success: true,
-      region: REGION_NAME,
-      cached: value,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: (error as Error).message,
-    });
-  }
-});
-
 // Start server
 async function start() {
   try {
-    // Connect to Redis
     await cache.connect();
-
-    // Connect to Kafka and subscribe
     await invalidationConsumer.connect();
     await invalidationConsumer.subscribe(handleInvalidation);
 
-    // Check origin health
     const originHealthy = await originClient.healthCheck();
     if (!originHealthy) {
-      console.warn("⚠️  Warning: Origin server not responding");
+      console.warn(" Warning: Origin server not responding");
     } else {
-      console.log("✅ Origin server connected");
+      console.log(" Origin server connected");
     }
 
-    // Start Express server
     app.listen(PORT, () => {
-      console.log(`Edge service [${REGION_NAME}] running on port ${PORT}`);
-      console.log(`Strategy: ${INVALIDATION_STRATEGY.toUpperCase()}`);
+      console.log(` Edge service [${REGION_NAME}] running on port ${PORT}`);
+      console.log(` Strategy: ${INVALIDATION_STRATEGY.toUpperCase()}`);
       console.log(
-        `Propagation delay: ${
+        ` Propagation delay: ${
           PROPAGATION_DELAY || getRegionDelay(REGION_NAME)
         }ms`
       );
-      console.log(`Health: http://localhost:${PORT}/health`);
-      console.log(`Content: http://localhost:${PORT}/api/content/:id`);
+      console.log(` Health: http://localhost:${PORT}/health`);
+      console.log(` Metrics: http://localhost:${PORT}/metrics`);
+      console.log(` Content: http://localhost:${PORT}/api/content/:id`);
     });
+
+    // Log metrics every 60 seconds
+    setInterval(() => {
+      metrics.logSummary(REGION_NAME);
+    }, 60000);
   } catch (error) {
     console.error("Failed to start edge service:", error);
     process.exit(1);
@@ -326,6 +320,7 @@ async function start() {
 // Graceful shutdown
 process.on("SIGINT", async () => {
   console.log("\n Shutting down gracefully...");
+  metrics.logSummary(REGION_NAME);
   await invalidationConsumer.disconnect();
   await cache.disconnect();
   process.exit(0);
