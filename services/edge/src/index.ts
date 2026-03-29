@@ -104,7 +104,7 @@ async function backgroundRevalidate(
   id: string
 ): Promise<void> {
   try {
-    console.log(`🔄 [${REGION_NAME}] Background revalidation: ${cacheKey}`);
+    console.log(`[${REGION_NAME}] Background revalidation: ${cacheKey}`);
 
     const content = await originClient.getContent(id);
 

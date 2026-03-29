@@ -179,6 +179,20 @@ services:
       - origin
     restart: unless-stopped
 
+  # Dashboard (static UI; browser calls APIs on host-published ports)
+  web:
+    build:
+      context: ./web
+      args:
+        VITE_ORIGIN_URL: http://localhost:4000
+        VITE_EDGE_US_URL: http://localhost:5001
+        VITE_EDGE_EU_URL: http://localhost:5002
+        VITE_EDGE_AP_URL: http://localhost:5003
+    container_name: edgesync-web
+    ports:
+      - "3000:80"
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   redis_us_data:
